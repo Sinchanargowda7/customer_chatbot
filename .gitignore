@@ -4,6 +4,8 @@ venv/
 env/
 *.db
 *.sqlite3
+.env
+backend/.env
 
 
 

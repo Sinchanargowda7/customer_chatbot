@@ -1,25 +1,44 @@
 import os
+import json
 import smtplib
-from email.mime.text import MIMEText
-from typing import Optional
-from fastapi import FastAPI, HTTPException, Header, Depends
+import bcrypt
+import requests
+from datetime import datetime, timedelta
+from typing import Optional, List
+from fastapi import FastAPI, HTTPException, Header, Depends, WebSocket, WebSocketDisconnect, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
+from jose import JWTError, jwt
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from jinja2 import Environment, FileSystemLoader
+from openai import AsyncOpenAI
+from bs4 import BeautifulSoup
+from pypdf import PdfReader
+from io import BytesIO
+
 import models
 from database import engine, get_db
 
-# Load variables from .env file (passwords, API keys)
+# --- CONFIGURATION ---
 load_dotenv()
+SECRET_KEY = os.getenv("SECRET_KEY", "supersecretkey123") 
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
-# Create Database Tables automatically if they don't exist
+# Create DB Tables
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI(title="Customer Support API")
+# Security & AI Setup
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+template_env = Environment(loader=FileSystemLoader('templates'))
 
-# --- CORS SETUP ---
-# This allows the frontend (running on localhost:5173) to talk to this backend (localhost:8000)
+app = FastAPI(title="AI Chatbot System")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -28,165 +47,331 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- EMAIL FUNCTION ---
-# Sends an actual email using SMTP (Gmail, etc.)
-def send_email_alert(to_email, subject, body):
-    sender = os.getenv("MAIL_FROM")
-    password = os.getenv("MAIL_PASSWORD")
-    smtp_server = os.getenv("MAIL_SERVER")
-    smtp_port = int(os.getenv("MAIL_PORT", 587))
+# --- AUTH UTILS ---
+def get_password_hash(password):
+    pwd_bytes = password.encode('utf-8')
+    salt = bcrypt.gensalt()
+    return bcrypt.hashpw(pwd_bytes, salt).decode('utf-8')
 
-    # Safety check: If config is missing, just print to console instead of crashing
-    if not sender or not password:
-        print(f"⚠️  Email not configured. Skipping alert to {to_email}")
-        print(f"   -> Content: {body}")
-        return
+def verify_password(plain_password, hashed_password):
+    plain_bytes = plain_password.encode('utf-8')
+    hashed_bytes = hashed_password.encode('utf-8')
+    return bcrypt.checkpw(plain_bytes, hashed_bytes)
 
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = sender
-    msg['To'] = to_email
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     try:
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls() # Encrypt the connection
-            server.login(sender, password)
-            server.sendmail(sender, to_email, msg.as_string())
-            print(f"✅ EMAIL SENT to {to_email}")
-    except Exception as e:
-        print(f"❌ FAILED to send email: {e}")
-
-# --- DATABASE INIT ---
-# Creates a Demo Client so you can test the app immediately
-def init_db():
-    db = next(get_db())
-    if not db.query(models.Client).filter_by(api_key="DEMO_KEY").first():
-        db.add(models.Client(
-            api_key="DEMO_KEY", name="Demo Corp",
-            email_sales="sales@demo.com", 
-            email_support="support@demo.com", 
-            email_billing="billing@demo.com"
-        ))
-        db.commit()
-init_db()
-
-# --- KEYWORD CONFIGURATION ---
-# Words that trigger automatic routing
-KEYWORDS = {
-    "SALES": ['buy', 'price', 'cost', 'upgrade', 'demo', 'purchase'],
-    "SUPPORT": ['error', 'bug', 'crash', 'help', 'login', 'reset', 'broken'],
-    "BILLING": ['refund', 'invoice', 'charge', 'payment', 'cancel', 'money']
-}
-
-# Words that reset the chat back to the main menu
-EXIT_KEYWORDS = ['menu', 'main menu', 'back', 'start over', 'reset', 'exit', 'home']
-
-# Initial questions the bot asks when entering a department
-CANNED_RESPONSES = {
-    "SALES": "I've connected you to Sales. To get started, please tell me **which product** you are interested in?",
-    "SUPPORT": "I've opened a ticket with Tech Support. Please describe the **error message** you are seeing.",
-    "BILLING": "I've connected you to Billing. For refunds, please provide your **Order ID** and **reason**.",
-    "GENERAL": "I'm not sure where to send that. Is this about Sales, Support, or Billing?"
-}
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None: raise HTTPException(status_code=401)
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+    
+    user = db.query(models.User).filter_by(username=username).first()
+    if user is None: raise HTTPException(status_code=401)
+    return user
 
 # --- DATA MODELS ---
-# Defines the shape of data we expect from the Frontend
-class ChatRequest(BaseModel):
-    text: str
-    session_id: str
-    current_dept: str = "GENERAL"
+class UserRegister(BaseModel):
+    username: str
+    password: str
 
-# --- LOGIC FUNCTIONS ---
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
 
-# Scans text to find if it matches any department keywords
-def detect_department(text):
-    text = text.lower()
-    for dept, words in KEYWORDS.items():
-        if any(w in text for w in words): return dept
-    return None
+class DepartmentCreate(BaseModel):
+    name: str
+    keywords: str
+    canned_response: str
+    knowledge_base: str = ""
+    email_recipient: str
 
-# Validates the API Key against the database
-async def verify_key(x_api_key: str = Header(...), db: Session = Depends(get_db)):
-    client = db.query(models.Client).filter_by(api_key=x_api_key).first()
-    if not client: raise HTTPException(403, "Invalid Key")
-    return client
+class ScrapeRequest(BaseModel):
+    urls: List[str]
 
-# --- API ENDPOINTS ---
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    role: str
+    username: str
 
-@app.get("/")
-def check_health():
-    return {"status": "Online"}
+# --- HELPER FUNCTIONS ---
+def scrape_website_text(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        for script in soup(["script", "style", "nav", "footer"]):
+            script.decompose()
+        text = soup.get_text()
+        lines = (line.strip() for line in text.splitlines())
+        chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+        text = '\n'.join(chunk for chunk in chunks if chunk)
+        return f"--- Source: {url} ---\n{text[:5000]}\n\n"
+    except Exception as e:
+        return f"Error scraping {url}: {str(e)}\n"
 
-@app.post("/api/chat/process")
-def process_chat(req: ChatRequest, client: models.Client = Depends(verify_key), db: Session = Depends(get_db)):
-    # 1. Log the User's Message to Database
-    db.add(models.ChatLog(session_id=req.session_id, sender="user", message=req.text, department=req.current_dept))
-    
-    response_dept = req.current_dept
-    response_msg = ""
-    action = "stay"
+def extract_pdf_text(file_content, filename):
+    try:
+        reader = PdfReader(BytesIO(file_content))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        return f"--- Source: {filename} ---\n{text[:5000]}\n\n"
+    except Exception as e:
+        return f"Error parsing PDF {filename}: {str(e)}\n"
 
-    # 2. CHECK FOR EXIT COMMANDS ("reset", "menu")
-    if req.text.lower().strip() in EXIT_KEYWORDS:
-        response_dept = "GENERAL"
-        response_msg = "You have returned to the main menu. How can I help you?"
-        action = "transfer" # Tell Frontend to reset UI
-        
-        # Log the reset event
-        db.add(models.ChatLog(session_id=req.session_id, sender="system", message="User requested reset to menu", department="GENERAL"))
-        db.add(models.ChatLog(session_id=req.session_id, sender="bot", message=response_msg, department="GENERAL"))
-        db.commit()
-        return {"department": response_dept, "bot_message": response_msg, "action": action}
+def send_email_alert(to_email, subject, context):
+    sender = os.getenv("MAIL_FROM")
+    password = os.getenv("MAIL_PASSWORD")
+    if not sender or not password: return 
 
-    # 3. SCENARIO A: User is in GENERAL (Needs routing)
-    if req.current_dept == "GENERAL":
-        detected = detect_department(req.text)
-        
-        if detected:
-            # Match Found! Transfer to new department
-            response_dept = detected
-            response_msg = CANNED_RESPONSES[detected]
-            action = "transfer"
-            
-            # Alert the new department via Email
-            dept_email = getattr(client, f'email_{detected.lower()}')
-            send_email_alert(
-                to_email=dept_email,
-                subject=f"New Chat Started: {req.session_id}",
-                body=f"User has entered the {detected} queue.\nInitial Query: {req.text}"
-            )
-        else:
-            # No Match: Ask for clarification
-            response_msg = CANNED_RESPONSES["GENERAL"]
-            
-    # 4. SCENARIO B: User is ALREADY in a department (Sending details)
-    else:
-        # Find who to email based on current department
-        dept_email = getattr(client, f'email_{req.current_dept.lower()}', 'admin@demo.com')
-        
-        # Send user's details to that agent
-        send_email_alert(
-            to_email=dept_email,
-            subject=f"Update on Chat: {req.session_id}",
-            body=f"User Provided Details:\n{req.text}"
+    try:
+        template = template_env.get_template('email_alert.html')
+        if 'timestamp' not in context:
+            context['timestamp'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        html_body = template.render(**context)
+        msg = MIMEMultipart("alternative")
+        msg['Subject'] = subject
+        msg['From'] = sender
+        msg['To'] = to_email
+        msg.attach(MIMEText(str(context), "plain"))
+        msg.attach(MIMEText(html_body, "html"))
+
+        with smtplib.SMTP(os.getenv("MAIL_SERVER", "smtp.gmail.com"), int(os.getenv("MAIL_PORT", 587))) as server:
+            server.starttls()
+            server.login(sender, password)
+            server.sendmail(sender, to_email, msg.as_string())
+            print(f"✅ Alert sent to {to_email}")
+    except Exception as e:
+        print(f"❌ Email Error: {e}")
+
+# --- AI LOGIC ---
+async def get_ai_response(user_text, department, db):
+    if not department: return "I'm not sure which department can help. Can you clarify?"
+    system_prompt = f"""
+    You are a helpful assistant for the {department.name} department.
+    Here is your Knowledge Base (Facts you know):
+    {department.knowledge_base}
+    Instructions:
+    1. Answer the user's question based ONLY on the Knowledge Base above.
+    2. If the answer is not in the Knowledge Base, say: "{department.canned_response}"
+    3. Be professional and concise.
+    """
+    try:
+        response = await openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text}
+            ],
+            temperature=0.3,
         )
-        
-        response_msg = "Thanks! I've updated your ticket with those details. Type 'menu' to start over or provide more info."
-        action = "stay"
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"AI Error: {e}")
+        return "I am having trouble connecting to my brain right now."
 
-    # 5. Log Bot Response to Database
-    db.add(models.ChatLog(session_id=req.session_id, sender="bot", message=response_msg, department=response_dept))
+async def detect_department_ai(text, db):
+    depts = db.query(models.Department).all()
+    if not depts: return None
+    dept_list = "\n".join([f"- {d.name}: {d.keywords}" for d in depts])
+    prompt = f"""
+    Classify the user input into one of these departments:
+    {dept_list}
+    Return ONLY the exact Department Name. If unsure, return 'GENERAL'.
+    User Input: {text}
+    """
+    try:
+        res = await openai_client.chat.completions.create(
+            model="gpt-3.5-turbo", messages=[{"role": "user", "content": prompt}], temperature=0
+        )
+        dept_name = res.choices[0].message.content.strip().upper()
+        return next((d for d in depts if d.name.upper() == dept_name), None)
+    except:
+        return None
+
+# --- AUTH ENDPOINTS ---
+@app.post("/api/auth/register")
+def register(user: UserRegister, db: Session = Depends(get_db)):
+    if db.query(models.User).filter_by(username=user.username).first():
+        raise HTTPException(status_code=400, detail="Username already registered")
+    role = "admin" if db.query(models.User).count() == 0 else "user"
+    new_user = models.User(username=user.username, password_hash=get_password_hash(user.password), role=role)
+    db.add(new_user)
     db.commit()
+    return {"msg": "User created successfully"}
 
-    return {"department": response_dept, "bot_message": response_msg, "action": action}
+@app.post("/api/auth/login", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(models.User).filter_by(username=form_data.username).first()
+    if not user or not verify_password(form_data.password, user.password_hash):
+        raise HTTPException(status_code=400, detail="Incorrect username or password")
+    access_token = create_access_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer", "role": user.role, "username": user.username}
 
-@app.post("/api/chat/transfer")
-def manual_transfer(target_dept: str, session_id: str, client: models.Client = Depends(verify_key), db: Session = Depends(get_db)):
-    # Handles manual button clicks (e.g., User clicks "Sales")
-    response_msg = CANNED_RESPONSES.get(target_dept, "How can we help?")
-    
-    db.add(models.ChatLog(session_id=session_id, sender="system", message=f"Manual transfer to {target_dept}", department=target_dept))
-    db.add(models.ChatLog(session_id=session_id, sender="bot", message=response_msg, department=target_dept))
+# --- ADMIN: USER MANAGEMENT ---
+@app.get("/api/users")
+def get_users(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
+    return db.query(models.User).all()
+
+@app.post("/api/users")
+def create_user(new_user: UserCreate, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
+    if db.query(models.User).filter_by(username=new_user.username).first():
+        raise HTTPException(400, "Username taken")
+    db_user = models.User(
+        username=new_user.username,
+        password_hash=get_password_hash(new_user.password),
+        role=new_user.role
+    )
+    db.add(db_user)
     db.commit()
+    return {"status": "created"}
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id: int, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
+    db.query(models.User).filter_by(id=user_id).delete()
+    db.commit()
+    return {"status": "deleted"}
+
+# --- ADMIN: TICKET LOGS ---
+@app.get("/api/tickets")
+def get_tickets(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
+    return db.query(models.ChatLog).order_by(models.ChatLog.timestamp.desc()).limit(50).all()
+
+# --- TRAINING TOOLS ---
+@app.post("/api/tools/scrape")
+def scrape_urls(req: ScrapeRequest, user: models.User = Depends(get_current_user)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
     
+    results = []
+    for url in req.urls:
+        if url.strip():
+            text = scrape_website_text(url.strip())
+            results.append({"source": url, "text": text})
+            
+    return {"results": results}
+
+@app.post("/api/tools/upload")
+async def upload_files(files: List[UploadFile] = File(...), user: models.User = Depends(get_current_user)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
+    
+    results = []
+    for file in files:
+        content = await file.read()
+        if file.content_type == "application/pdf":
+            text = extract_pdf_text(content, file.filename)
+        else:
+            text = content.decode("utf-8", errors="ignore")
+            text = f"--- Source: {file.filename} ---\n{text[:5000]}\n\n"
+        results.append({"source": file.filename, "text": text})
+            
+    return {"results": results}
+
+# --- DEPARTMENTS API ---
+@app.get("/api/departments")
+def get_departments(user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
+    return db.query(models.Department).all()
+
+@app.post("/api/departments")
+def add_department(dept: DepartmentCreate, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
+    new_dept = models.Department(**dept.dict(), owner_id=user.id)
+    db.add(new_dept)
+    db.commit()
     return {"status": "ok"}
+
+@app.put("/api/departments/{dept_id}")
+def update_department(dept_id: int, dept: DepartmentCreate, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
+    db_dept = db.query(models.Department).filter_by(id=dept_id).first()
+    if not db_dept: raise HTTPException(404, detail="Department not found")
+    
+    db_dept.name = dept.name
+    db_dept.keywords = dept.keywords
+    db_dept.canned_response = dept.canned_response
+    db_dept.knowledge_base = dept.knowledge_base
+    db_dept.email_recipient = dept.email_recipient
+    
+    db.commit()
+    return {"status": "updated"}
+
+@app.delete("/api/departments/{dept_id}")
+def delete_department(dept_id: int, user: models.User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if user.role != "admin": raise HTTPException(403, "Admins only")
+    db.query(models.Department).filter_by(id=dept_id).delete()
+    db.commit()
+    return {"status": "deleted"}
+
+# --- WEBSOCKET CHAT ---
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: list[WebSocket] = []
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+    def disconnect(self, websocket: WebSocket):
+        self.active_connections.remove(websocket)
+    async def send_message(self, message: dict, websocket: WebSocket):
+        await websocket.send_json(message)
+manager = ConnectionManager()
+
+@app.websocket("/ws/{client_id}")
+async def websocket_endpoint(websocket: WebSocket, client_id: str, db: Session = Depends(get_db)):
+    await manager.connect(websocket)
+    try:
+        while True:
+            data_json = await websocket.receive_text()
+            data = json.loads(data_json)
+            user_text = data.get("text")
+            current_dept_name = data.get("current_dept", "GENERAL")
+
+            db.add(models.ChatLog(session_id=client_id, sender="user", message=user_text, department=current_dept_name))
+            db.commit()
+
+            response_dept = current_dept_name
+            response_msg = ""
+            action = "stay"
+
+            if user_text.lower().strip() in ['menu', 'exit', 'reset']:
+                response_dept = "GENERAL"
+                response_msg = "Returned to main menu."
+                action = "transfer"
+            
+            elif current_dept_name == "GENERAL":
+                detected_dept = await detect_department_ai(user_text, db)
+                if detected_dept:
+                    response_dept = detected_dept.name
+                    response_msg = await get_ai_response(user_text, detected_dept, db)
+                    action = "transfer"
+                    send_email_alert(detected_dept.email_recipient, f"New Chat: {client_id}", 
+                                     {"session_id": client_id, "department": response_dept, "user_message": user_text})
+                else:
+                    response_msg = "I'm not sure where to route that. Can you provide more details?"
+            else:
+                curr_dept = db.query(models.Department).filter_by(name=current_dept_name).first()
+                response_msg = await get_ai_response(user_text, curr_dept, db)
+                if curr_dept:
+                    pass 
+
+            db.add(models.ChatLog(session_id=client_id, sender="bot", message=response_msg, department=response_dept))
+            db.commit()
+
+            await manager.send_message({
+                "department": response_dept, "bot_message": response_msg, "action": action
+            }, websocket)
+
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)

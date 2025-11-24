@@ -3,24 +3,36 @@ from sqlalchemy.orm import relationship
 from datetime import datetime
 from database import Base
 
-class Client(Base):
-    __tablename__ = "clients"
+class User(Base):
+    __tablename__ = "users"
 
     id = Column(Integer, primary_key=True, index=True)
-    api_key = Column(String, unique=True, index=True)
-    name = Column(String)
+    username = Column(String, unique=True, index=True)
+    password_hash = Column(String)
+    role = Column(String, default="user") # 'admin' or 'user'
     
-    # Where emails go for this specific client
-    email_sales = Column(String)
-    email_support = Column(String)
-    email_billing = Column(String)
+    # Relationship to Departments
+    departments = relationship("Department", back_populates="owner")
+
+class Department(Base):
+    __tablename__ = "departments"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String)          
+    keywords = Column(String)      
+    canned_response = Column(Text) 
+    knowledge_base = Column(Text, default="") # The "Brain" of the department
+    email_recipient = Column(String) 
+    
+    owner_id = Column(Integer, ForeignKey("users.id"))
+    owner = relationship("User", back_populates="departments")
 
 class ChatLog(Base):
     __tablename__ = "chat_logs"
 
     id = Column(Integer, primary_key=True, index=True)
     session_id = Column(String, index=True)
-    sender = Column(String) # 'user' or 'bot'
+    sender = Column(String) 
     message = Column(Text)
-    department = Column(String) # Which dept handled this
+    department = Column(String) 
     timestamp = Column(DateTime, default=datetime.utcnow)

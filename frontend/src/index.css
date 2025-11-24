@@ -1,5 +1,21 @@
-@import "tailwindcss";
+/* @import "tailwindcss";
 
 html {
   scroll-behavior: smooth;
+} */
+
+@import "tailwindcss";
+
+/* Reset default browser margins so the app takes full width */
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden; /* Prevent horizontal scrollbars */
+}
+
+/* Optional: Give the background a slight color so it's not blinding white */
+body {
+  background-color: #f3f4f6; 
 }
